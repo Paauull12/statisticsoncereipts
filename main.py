@@ -1,3 +1,4 @@
+import ollama
 import easyocr
 import time
 import re
@@ -38,6 +39,20 @@ def get_easyocr_reader():
     model_loader = ModelLoader()
     return model_loader.get_model()
 
+
+def extract_float_from_string(s: str) -> float:
+    # Regular expression pattern to match floating point numbers
+    pattern = r'[-+]?\d*\.\d+|[-+]?\d+'
+
+    # Find all matches in the string
+    matches = re.findall(pattern, s)
+
+    if matches:
+        # Return the first match as a float
+        return float(matches[0])
+    else:
+        raise ValueError(f"No valid float found in the string: {s}")
+
 def replace_except_chars(s, chars_to_keep, replacement_char):
     pattern = f'[^{re.escape(chars_to_keep)}]'
     return re.sub(pattern, replacement_char, s)
@@ -53,26 +68,42 @@ def resultIsTotal(text):
     possibleResult = ["total", "balance", "net total", "payment", "amount"]
     return formattedText in possibleResult
 
-def findTextOnTheSameLineWithC(thetotalword, word, c):
+def findTextOnTheSameLine(thetotalword, word):
+    """
+    Checks if the bounding box of a text is on the same line with another bounding box while considering a
+    dynamically chosen vertical offset error.
+    """
     bbox = np.array(thetotalword, dtype=np.int32)
     firsty = bbox[0][1]
     secondy = bbox[3][1]
+
     bbox = np.array(word, dtype=np.int32)
     newfirsty = bbox[0][1]
     newsecondy = bbox[3][1]
-    return firsty - c <= newfirsty and secondy + c >= newsecondy
+
+    # calculate an error threshold that is equal to half the height of the "total" text
+    c = (secondy - firsty) / 2
+
+    # check if either the top or bottom sides of one bounding box are within a tolerated distance from the top and
+    # bottom sides of the other bounding box
+    return abs(firsty-newfirsty) < c or abs(secondy-newsecondy) < c
 
 def imageProcessorWithEasyocr(img_path):
+    """
+    Process a receipt by using only EasyOCR. No other post-processing.
+
+    Details: Extract text with EasyOcr, find the "TOTAL" label and look for a price tag on the same line with the label.
+    """
     start_time = time.time()
     reader = get_easyocr_reader() 
-    results = reader.readtext(img_path)
+    results = reader.readtext(img_path, width_ths=0.75, min_size=5, link_threshold=0.2)
 
     listOfTotals = [result for result in results if resultIsTotal(result[1])]
 
     listOfPrices = []
     for result in listOfTotals:
         for words in results:
-            if findTextOnTheSameLineWithC(result[0], words[0], 40) and result != words:
+            if result != words and findTextOnTheSameLine(result[0], words[0]):
                 number = getNumber(words[1])
                 regex = r'^[^0-9]*([0-9]+\.[0-9]{2}).*$'
                 pattern = re.compile(regex)
@@ -83,6 +114,34 @@ def imageProcessorWithEasyocr(img_path):
                     listOfPrices.append(float(getNumber(match.group(1))))
     end_time = time.time()
     return max(listOfPrices) if listOfPrices else "", end_time - start_time
+
+def imageProcessorWithEasyOcrAndLLM(img_path, model_name, prompt):
+    """
+    Process a receipt by using EasyOCR along with a LLM for post-processing.
+
+    Details: Extract text with EasyOCR, pass the result line by line to an LLM and ask it about the total price.
+
+    :param model_name: name of the ollama model to be used
+    :param prompt: custom instructions for the model
+    """
+    start_time = time.time()
+    reader = get_easyocr_reader()
+    results = reader.readtext(img_path, width_ths=10000, min_size=5, link_threshold=0.1)
+
+    concatenated_results = ""
+    for r in results:
+        concatenated_results += f"{r[1]}\n"
+
+    response = ollama.chat(model=model_name, messages=[
+        {
+            'role': 'user',
+            'content': f'{prompt} . Context: "{concatenated_results}"'
+        },
+    ])
+    total_price_str = getNumber(response['message']['content'])
+
+    end_time = time.time()
+    return extract_float_from_string(total_price_str), end_time - start_time
 
 def getInformationFromReceipt(img_path):
     start_time = time.time()
@@ -112,7 +171,7 @@ def getInformationFromReceipt(img_path):
 
 def mainFunctionForStatistics():
     json_file_path = './test/metadata.jsonl'
-    workbook = load_workbook('statictisc.xlsx')
+    workbook = load_workbook('statictisc_4_link_ths_and_min_size_parameters.xlsx')
     sheet = workbook.active
 
     final_data = {}
@@ -149,7 +208,17 @@ def mainFunctionForStatistics():
         if match:
             final_price = match.group(1)
 
-        result1, time1 = imageProcessorWithEasyocr(file_path)
+        # using only EasyOCR
+        # result1, time1 = imageProcessorWithEasyocr(file_path)
+
+        # using EasyOCR + LLM
+        result1, time1 = imageProcessorWithEasyOcrAndLLM(
+            file_path,
+            model_name="mistral:7b",
+            prompt=(
+                f'You are given raw text data of a receipt. Extract and return only the total amount of money to be paid by the customer as a number (e.g., 123.45).')
+        )
+
         result2, time2 = getInformationFromReceipt(file_path)
 
         column = 'A'
