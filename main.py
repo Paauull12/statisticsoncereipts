@@ -1,5 +1,6 @@
 import ollama
 import easyocr
+import regex
 import time
 import re
 from transformers import DonutProcessor, VisionEncoderDecoderModel
@@ -41,17 +42,16 @@ def get_easyocr_reader():
 
 
 def extract_float_from_string(s: str) -> float:
-    # Regular expression pattern to match floating point numbers
     pattern = r'[-+]?\d*\.\d+|[-+]?\d+'
 
-    # Find all matches in the string
-    matches = re.findall(pattern, s)
+    clean_string = re.sub(r'[^\d\.\-+]', ' ', s) 
+
+    matches = re.findall(pattern, clean_string)
 
     if matches:
-        # Return the first match as a float
         return float(matches[0])
     else:
-        raise ValueError(f"No valid float found in the string: {s}")
+        return None
 
 def replace_except_chars(s, chars_to_keep, replacement_char):
     pattern = f'[^{re.escape(chars_to_keep)}]'
@@ -65,8 +65,39 @@ def getNumber(stringThatIsAlMostAnumber):
 
 def resultIsTotal(text):
     formattedText = text.strip().lower()
-    possibleResult = ["total", "balance", "net total", "payment", "amount"]
-    return formattedText in possibleResult
+
+    possibleResults = [
+        # English
+        "total", "balance", "net total", "payment", "amount",
+        
+        # French
+        "total", "solde", "total net", "paiement", "montant",
+
+        # Spanish
+        "total", "saldo", "total neto", "pago", "cantidad",
+
+        # German
+        "gesamt", "saldo", "nettobetrag", "zahlung", "betrag",
+
+        # Italian
+        "totale", "saldo", "totale netto", "pagamento", "importo",
+
+        # Portuguese
+        "total", "saldo", "total líquido", "pagamento", "quantia",
+
+        # Dutch
+        "totaal", "saldo", "netto totaal", "betaling", "bedrag",
+
+        # Swedish
+        "total", "saldo", "nettobelopp", "betalning", "belopp"
+    ]
+
+    for result in possibleResults:
+        max_errors = max(1, len(result) // 3) 
+        if regex.search(f'({result}){{e<={max_errors}}}', formattedText):
+            return True
+
+    return False
 
 def findTextOnTheSameLine(thetotalword, word):
     """
@@ -81,11 +112,8 @@ def findTextOnTheSameLine(thetotalword, word):
     newfirsty = bbox[0][1]
     newsecondy = bbox[3][1]
 
-    # calculate an error threshold that is equal to half the height of the "total" text
     c = (secondy - firsty) / 2
 
-    # check if either the top or bottom sides of one bounding box are within a tolerated distance from the top and
-    # bottom sides of the other bounding box
     return abs(firsty-newfirsty) < c or abs(secondy-newsecondy) < c
 
 def imageProcessorWithEasyocr(img_path):
@@ -96,24 +124,34 @@ def imageProcessorWithEasyocr(img_path):
     """
     start_time = time.time()
     reader = get_easyocr_reader() 
-    results = reader.readtext(img_path, width_ths=0.75, min_size=5, link_threshold=0.2)
+    results = reader.readtext(img_path, width_ths=10000, min_size=5, link_threshold=0.1)
 
     listOfTotals = [result for result in results if resultIsTotal(result[1])]
 
     listOfPrices = []
     for result in listOfTotals:
         for words in results:
-            if result != words and findTextOnTheSameLine(result[0], words[0]):
-                number = getNumber(words[1])
-                regex = r'^[^0-9]*([0-9]+\.[0-9]{2}).*$'
-                pattern = re.compile(regex)
-                
-                match = pattern.search(number)
+            if findTextOnTheSameLine(result[0], words[0]) and result != words:
+                number = extract_float_from_string(words[1])
+                if number:
+                    listOfPrices.append(words)
 
-                if match:
-                    listOfPrices.append(float(getNumber(match.group(1))))
+    for item in listOfTotals:
+        number = extract_float_from_string(item[1])
+        if number:
+            listOfPrices.append(item)
     end_time = time.time()
-    return max(listOfPrices) if listOfPrices else "", end_time - start_time
+
+    try:
+        #trebuie sa extragem tot ce inseaman 
+        maxim, conf = -1, -1
+        for item in listOfPrices:
+            if extract_float_from_string(item[1]) and extract_float_from_string(item[1]) > maxim:
+                maxim = extract_float_from_string(item[1])
+                conf = int(item[2])
+        return maxim, end_time - start_time
+    except Exception as e:
+        return "0.0", end_time - start_time
 
 def imageProcessorWithEasyOcrAndLLM(img_path, model_name, prompt):
     """
@@ -138,6 +176,7 @@ def imageProcessorWithEasyOcrAndLLM(img_path, model_name, prompt):
             'content': f'{prompt} . Context: "{concatenated_results}"'
         },
     ])
+
     total_price_str = getNumber(response['message']['content'])
 
     end_time = time.time()
@@ -149,9 +188,10 @@ def getInformationFromReceipt(img_path):
         image = Image.open(img_path).convert("RGB")
         pixel_values = processor(image, return_tensors="pt").pixel_values
         generated_ids = model.generate(pixel_values)
-        output_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        processing =  processor.batch_decode(generated_ids, skip_special_tokens=True)
+        output_text = processing[0]
         total_matches = re.findall(r'<s_total>(.*?)</s_total>', output_text)
-        
+
         if total_matches:
             total_text = total_matches[0]
             
@@ -171,7 +211,7 @@ def getInformationFromReceipt(img_path):
 
 def mainFunctionForStatistics():
     json_file_path = './test/metadata.jsonl'
-    workbook = load_workbook('statictisc_4_link_ths_and_min_size_parameters.xlsx')
+    workbook = load_workbook('statictisc.xlsx')
     sheet = workbook.active
 
     final_data = {}
@@ -191,8 +231,26 @@ def mainFunctionForStatistics():
     red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
     yello_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
 
+     #stat of avrg 
+
+    model1_time = 0
+    model2_time = 0
+    model3_time = 0
+    no_of_pics = 0
+
+    model1_corr = 0
+    model1_wrong = 0
+    model1_emtpy = 0
+    model2_corr = 0
+    model2_wrong = 0
+    model2_emtpy = 0
+    model3_corr = 0
+    model3_wrong = 0
+    model3_emtpy = 0
+    #end of avrg
+
     row = 2
-    number_of_runs = 9
+    number_of_runs = 100
     for key in final_data:
         values = final_data[key]
 
@@ -208,29 +266,34 @@ def mainFunctionForStatistics():
         if match:
             final_price = match.group(1)
 
-        # using only EasyOCR
-        # result1, time1 = imageProcessorWithEasyocr(file_path)
-
         # using EasyOCR + LLM
-        result1, time1 = imageProcessorWithEasyOcrAndLLM(
+        result1, time1= imageProcessorWithEasyOcrAndLLM(
             file_path,
-            model_name="mistral:7b",
+            model_name="mistral",
             prompt=(
                 f'You are given raw text data of a receipt. Extract and return only the total amount of money to be paid by the customer as a number (e.g., 123.45).')
         )
 
         result2, time2 = getInformationFromReceipt(file_path)
 
+        result3, time3 = imageProcessorWithEasyocr(file_path)
+
+        no_of_pics += 1
+        model1_time += time1
+        model2_time += time2
+        model3_time += time3
+
         column = 'A'
 
         print("---------------------------------------------------------")
-        print(file_path + " -> " + final_price + " and the result are -> " + str(result1) + " in " + str("{:.2f}".format(time1)) + " seconds > " + str(result2)+ " in " + str("{:.2f}".format(time2)) + " seconds ")
+        print(file_path + " -> " + final_price + " and the result are -> " + str(result1) + " in " + str("{:.2f}".format(time1)) + " seconds > " + str(result2)+ " in " + str("{:.2f}".format(time2)) + " seconds > " + str(result3)+ " in " + str("{:.2f}".format(time3)) + " seconds ")
         print("---------------------------------------------------------")
         #now that we have the info we need to start to fill the statisctis
 
-        val1 = getNumber(str(result1)).strip()
-        val2 = getNumber(str(result2)).strip()
-        compareto = getNumber(str(final_price)).strip()
+        val1 = extract_float_from_string(str(result1))
+        val2 = extract_float_from_string(str(result2))
+        val3 = extract_float_from_string(str(result3))
+        compareto = extract_float_from_string(str(final_price))
         sheet[column+str(row)].value = file_name
 
         column = increment_letter(column)
@@ -245,11 +308,12 @@ def mainFunctionForStatistics():
         column = increment_letter(column)
         if val1 == compareto:
             sheet[column+str(row)].fill = green_fill
-        elif val1 in compareto and val1:
-            print(f"aici avem un fals >{val1}<")
+            model1_corr += 1
+        elif str(val1) in str(compareto) and str(val1):
             sheet[column+str(row)].fill = yello_fill
         else:
             sheet[column+str(row)].fill = red_fill
+            model1_wrong += 1
 
         column = increment_letter(column)
         sheet[column+str(row)].value = getNumber(str(result2))
@@ -260,17 +324,61 @@ def mainFunctionForStatistics():
         column = increment_letter(column)
         if val2 == compareto:
             sheet[column+str(row)].fill = green_fill
-        elif val2 in compareto and val2:
-            print(f"aici avem un fals {val2}")
+            model2_corr += 1
+        elif str(val2) in str(compareto) and str(val2):
             sheet[column+str(row)].fill = yello_fill
         else:
             sheet[column+str(row)].fill = red_fill
+            model2_wrong += 1
+
+        column = increment_letter(column)
+        sheet[column+str(row)].value = getNumber(str(result3))
+
+        column = increment_letter(column)
+        sheet[column+str(row)].value = "{:.2f}".format(time3)
+
+        column = increment_letter(column)
+        if str(val3) == "-1":
+            model3_emtpy += 1
+        if val3 == compareto:
+            model3_corr += 1
+            sheet[column+str(row)].fill = green_fill
+        elif str(val3) in str(compareto) and str(val3):
+            sheet[column+str(row)].fill = yello_fill
+        else:
+            sheet[column+str(row)].fill = red_fill
+            model3_wrong += 1
 
         row += 1
 
         if row >= number_of_runs:
             break
 
+
+    model1_time /= no_of_pics
+    model2_time /= no_of_pics
+    model3_time /= no_of_pics
+    sheet['M2'].value = f"{model1_time:.2f}"
+    sheet['M3'].value = f"{model2_time:.2f}"
+    sheet['M4'].value = f"{model3_time:.2f}"
+    sheet['N2'].value = f"{no_of_pics}"
+    sheet['O2'].value = f"{model1_corr}"
+    sheet['P2'].value = f"{model1_wrong}"
+    sheet['Q2'].value = f"{model1_emtpy}"
+    sheet['R2'].value = f"{model1_corr / no_of_pics:.2f}"
+    sheet['S2'].value = f"{model1_corr / (model1_corr + model1_wrong):.2f}"
+    sheet['N3'].value = f"{no_of_pics}"
+    sheet['O3'].value = f"{model2_corr}"
+    sheet['P3'].value = f"{model2_wrong}"
+    sheet['Q3'].value = f"{model2_emtpy}"
+    sheet['R3'].value = f"{model2_corr / no_of_pics:.2f}"
+    sheet['S3'].value = f"{model2_corr / (model2_corr + model2_wrong):.2f}"
+    sheet['N4'].value = f"{no_of_pics}"
+    sheet['O4'].value = f"{model3_corr}"
+    sheet['P4'].value = f"{model3_wrong}"
+    sheet['Q4'].value = f"{model3_emtpy}"
+    sheet['R4'].value = f"{model3_corr / no_of_pics:.2f}"
+    sheet['S4'].value = f"{model3_corr / (model3_corr + model3_wrong):.2f}"
     workbook.save('statictisc.xlsx')
     
 
